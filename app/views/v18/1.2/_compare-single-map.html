@@ -4,6 +4,11 @@
   `compareMode` and `compareModeLabel`, extend this file and fill the `compareControls`
   block with the control that sits above the map. Everything else (map, data, tables)
   is shared here so the variants differ only in how the two versions are toggled.
+  A page can also wrap the sidebar layout's Previous tab content by setting the
+  `previousPanelBefore` / `previousPanelAfter` HTML captures before it extends this file:
+  view-land-parcel-dates-list shows a list of dates there first, and only reveals the
+  tables once a date is chosen. That page also swaps the previous version at runtime via
+  loadPreviousSnapshot(file, dateLabel), defined next to swapParcelDatasets below.
 
   compareLayout (optional):
     stacked  – default: map on top, one merged table below (page scrolls as a document)
@@ -294,6 +299,11 @@
     font-weight: 700;
   }
 
+  /* The Total row closes each table: no rule under it. */
+  tr[data-total-row] > .govuk-table__cell {
+    border-bottom: 0;
+  }
+
   /* Difference marks: a GOV.UK tag in the row's first cell (Added / Removed / Changed), and
      for a change an up/down arrow before the value in the numeric cell. */
   tr.app-diff .govuk-tag {
@@ -516,7 +526,7 @@
 {% set currentPanel %}
   <div id="current-tab-last-updated" hidden>
     {% call govukInsetText({ classes: "govuk-!-margin-top-0 govuk-!-margin-bottom-2 guidance-panel" }) %}
-      <p class="govuk-!-margin-bottom-0">Last updated <span id="current-tab-last-updated-date"></span>.</p>
+      <p class="govuk-!-margin-bottom-0">Updated <span id="current-tab-last-updated-date"></span></p>
     {% endcall %}
   </div>
   <h3 class="govuk-heading-s govuk-!-margin-bottom-0 govuk-!-margin-top-2">Summary</h3>
@@ -561,9 +571,17 @@
 {% endset %}
 
 {% set previousPanel %}
+{# A page can wrap the Previous tab's content by setting `previousPanelBefore` and
+   `previousPanelAfter` (HTML captures) before it extends this file — view-land-parcel-dates-list
+   puts a list of dates in front of these tables and wraps them in a hidden container.
+   Variables rather than a block: Nunjucks does not register a block that sits inside a
+   `set` capture, so a block here could neither have a default nor support super(). #}
+{{ previousPanelBefore | default("") | safe }}
   <div id="previous-tab-date-range" hidden>
     {% call govukInsetText({ classes: "govuk-!-margin-top-0 govuk-!-margin-bottom-2 guidance-panel" }) %}
-      <p class="govuk-!-margin-bottom-0">Version from <span id="previous-tab-date-range-text"></span>.</p>
+      {# The wording before the date can be set by the extending page (view-land-parcel-dates-list
+         says "Valid until" and fills in a single date); by default it is "Version from" + range. #}
+      <p class="govuk-!-margin-bottom-0">{{ previousDateInsetPrefix | default("Version from") }} <span id="previous-tab-date-range-text"></span></p>
     {% endcall %}
   </div>
   <h3 class="govuk-heading-s govuk-!-margin-bottom-0 govuk-!-margin-top-2">Summary</h3>
@@ -605,6 +623,7 @@
     </thead>
     <tbody class="govuk-table__body" id="hedgerows-table-body-previous"></tbody>
   </table>
+{{ previousPanelAfter | default("") | safe }}
 {% endset %}
 
 <main class="app-map-fullscreen" id="main-content">
@@ -937,14 +956,18 @@
     // Ids. Both versions' land covers live on ONE map as two permanent datasets,
     // namespaced by version. The datasets adapter names the source
     // `geojson-<datasetId>`, a sublayer's fill `<datasetId>-<sublayerId>` (+ `-stroke`),
-    // and a plain line/outline dataset's single layer `<datasetId>`. The parcel outline
-    // and hedgerows are identical in both versions, so there is one of each.
+    // and a plain line/outline dataset's single layer `<datasetId>`. The hedgerows are
+    // identical in both versions, so there is one hedgerow dataset. The parcel outline is
+    // drawn for the current version, plus a dashed previous-version outline that only
+    // carries a feature when a snapshot's boundary differs from today's (see
+    // previousOutlineFeatures) — most snapshots share the live outline and draw nothing.
     // ───────────────────────────────────────────────────────────────────────────
     const VERSIONS = ['previous', 'current']
     const VERSION_LABEL = { previous: 'Previous details', current: 'Current details' }
     const DS = {
       landCover: (version) => 'land-cover-' + version,
       outline: 'parcel-outline',
+      outlinePrevious: 'parcel-outline-previous',
       hedgerows: 'hedgerows',
       keyPrevious: 'key-previous-version',            // Key-only entry explaining the faded style
       keyChange: (kind) => 'key-change-' + kind        // Key-only entries for the change outlines
@@ -972,6 +995,8 @@
     let interactiveMap = null
     let hedgeMap = null        // raw MapLibre map (from the map:ready payload; no public accessor)
     let data = null            // { previous, current, marks } once loaded; re-applied after a style change
+    let rawParcels = null      // the parcel + hedgerow WFS responses as fetched, kept so another
+    let rawHedges = null       // previous snapshot can be assembled without refetching them
     // Per version: the cover types on the parcel, and the ones the user has switched off.
     // Tracked separately because the two mean different things once the types are
     // individually toggleable: absent-from-this-parcel (never listed) vs.
@@ -1185,13 +1210,29 @@
       return tr
     }
 
+    // The Summary rows are static markup that markRow decorates in place (tag, arrow, hidden
+    // "was" text) and neither render function rebuilds. Strip those decorations so a re-render
+    // for another previous snapshot starts clean instead of stacking marks up.
+    function resetSummaryRows () {
+      ['parcel-total-area', 'parcel-land-covers', 'parcel-hedgerows'].forEach(base => {
+        [base, base + '-previous', base + '-current'].forEach(id => {
+          const cell = document.getElementById(id)
+          const tr = cell && cell.closest('tr')
+          if (!tr) return
+          tr.classList.remove(...[...tr.classList].filter(c => c.startsWith('app-diff')))
+          tr.querySelectorAll('.govuk-tag, .app-diff__arrow, .govuk-visually-hidden').forEach(n => n.remove())
+        })
+      })
+    }
+
     function renderMergedTables (dPrev, dCurr, marks) {
       const el = (id) => document.getElementById(id)
       const rowFor = (body, attr, version, id) =>
         el(body).querySelector('tr[data-version="' + version + '"][data-' + attr + '="' + id + '"]')
 
-      // Summary. The parcel boundary is the same in both versions, so Total area never
-      // changes here; the counts can.
+      // Summary: the current version's figures; each is marked below when the previous
+      // version's differs (a snapshot can carry a different parcel boundary, so Total area
+      // can change too).
       el('parcel-total-area').textContent = parseFloat(dCurr.selectedFeature.properties.AREA_HA).toFixed(4)
       el('parcel-land-covers').textContent = dCurr.parcelCovers.length
       el('parcel-hedgerows').textContent = dCurr.parcelHedges.length
@@ -1224,9 +1265,10 @@
       marks.hedges.curr.forEach((m, id) => markRow(rowFor('hedgerows-table-body', 'hedge-id', 'current', id), m))
       marks.hedges.prev.forEach((m, id) => { if (m.kind === 'removed') markRow(rowFor('hedgerows-table-body', 'hedge-id', 'previous', id), m) })
 
-      // Totals and Summary counts.
-      markIfChanged(lcBody.querySelector('tr[data-total-row]'), sumArea(dPrev.parcelCovers), sumArea(dCurr.parcelCovers), 4)
-      markIfChanged(hBody.querySelector('tr[data-total-row]'), sumLength(dPrev.parcelHedges), sumLength(dCurr.parcelHedges), 0)
+      // Summary rows. The Total rows under each table are left unmarked: a total moves
+      // whenever any row above it does, so a tag and arrow there repeat what the rows
+      // already say.
+      markIfChanged(el('parcel-total-area').closest('tr'), parseFloat(dPrev.selectedFeature.properties.AREA_HA), parseFloat(dCurr.selectedFeature.properties.AREA_HA), 4)
       markIfChanged(el('parcel-land-covers').closest('tr'), dPrev.parcelCovers.length, dCurr.parcelCovers.length, 0)
       markIfChanged(el('parcel-hedgerows').closest('tr'), dPrev.parcelHedges.length, dCurr.parcelHedges.length, 0)
 
@@ -1237,7 +1279,8 @@
     // marks match the two-map compare pages: Added and Changed (with the arrow and the old
     // value) on the current version's rows, Removed and Changed (tag only — an arrow next to
     // the previous value would read as the previous value itself having moved) on the
-    // previous version's. Totals and Summary counts are marked on both sides when they differ.
+    // previous version's. Summary counts are marked on both sides when they differ; the
+    // Total rows under each table are not (see renderMergedTables).
     function renderVersionTables (dPrev, dCurr, marks) {
       const el = (id) => document.getElementById(id)
       const dataFor = { previous: dPrev, current: dCurr }
@@ -1275,9 +1318,7 @@
         markRow(prevTr, { kind: 'changed' })
         markRow(currTr, { kind: 'changed', direction: curr > prev ? 'up' : 'down', was: prev.toFixed(dp) })
       }
-      const totalRowIn = (base, version) => el(base + '-' + version).querySelector('tr[data-total-row]')
-      both(totalRowIn('land-covers-table-body', 'previous'), totalRowIn('land-covers-table-body', 'current'), sumArea(dPrev.parcelCovers), sumArea(dCurr.parcelCovers), 4)
-      both(totalRowIn('hedgerows-table-body', 'previous'), totalRowIn('hedgerows-table-body', 'current'), sumLength(dPrev.parcelHedges), sumLength(dCurr.parcelHedges), 0)
+      both(el('parcel-total-area-previous').closest('tr'), el('parcel-total-area-current').closest('tr'), parseFloat(dPrev.selectedFeature.properties.AREA_HA), parseFloat(dCurr.selectedFeature.properties.AREA_HA), 4)
       both(el('parcel-land-covers-previous').closest('tr'), el('parcel-land-covers-current').closest('tr'), dPrev.parcelCovers.length, dCurr.parcelCovers.length, 0)
       both(el('parcel-hedgerows-previous').closest('tr'), el('parcel-hedgerows-current').closest('tr'), dPrev.parcelHedges.length, dCurr.parcelHedges.length, 0)
 
@@ -1351,6 +1392,38 @@
       }
     }
 
+    // The previous version's parcel outline: dashed, in the outline colour, faded like the
+    // previous covers. Permanent, like the others; its data is the previous boundary when
+    // that differs from the current one and empty otherwise (previousOutlineFeatures), and
+    // it shows/hides with the previous version (setVersionVisibility).
+    function buildPreviousOutlineDataset (features) {
+      return {
+        id: DS.outlinePrevious,
+        label: 'Land parcel (previous details)',
+        geojson: { type: 'FeatureCollection', features },
+        style: { fill: 'transparent', stroke: palette.parcelBorder, strokeWidth: 3, strokeDashArray: [3, 2], opacity: 0.7 },
+        showInKey: false,
+        showInMenu: false
+      }
+    }
+
+    // The previous boundary, only when it is not the same shape as the current one: a
+    // dashed outline exactly under the solid one would add nothing but noise.
+    function previousOutlineFeatures () {
+      if (!data || !data.previous.selectedFeature || !data.current.selectedFeature) return []
+      const same = JSON.stringify(data.previous.selectedFeature.geometry) === JSON.stringify(data.current.selectedFeature.geometry)
+      return same ? [] : [data.previous.selectedFeature]
+    }
+
+    // Bounds covering both versions' outlines, so a previous boundary that reaches beyond
+    // today's is framed too.
+    function bothVersionsBounds () {
+      const b = computeBounds(data.current.selectedFeature)
+      if (!previousOutlineFeatures().length) return b
+      const p = computeBounds(data.previous.selectedFeature)
+      return [Math.min(b[0], p[0]), Math.min(b[1], p[1]), Math.max(b[2], p[2]), Math.max(b[3], p[3])]
+    }
+
     // The parcel's hedgerows. Built once at construction and thereafter re-applied with
     // setData (see swapParcelDatasets), so it is a permanent dataset — when a parcel has no
     // hedges its data is emptied and the layer is hidden (which also drops it from the Key).
@@ -1403,6 +1476,8 @@
         if (visible) hiddenCovers[version].delete(type); else hiddenCovers[version].add(type)
         datasetsPlugin.setDatasetVisibility(visible, { datasetId: DS.landCover(version), sublayerId: lcSublayerId(type) })
       })
+      // The previous boundary (when there is one) comes and goes with the previous version.
+      if (version === 'previous') datasetsPlugin.setDatasetVisibility(visible, { datasetId: DS.outlinePrevious })
       syncOverlayLayers()
     }
 
@@ -1420,6 +1495,7 @@
           datasetsPlugin.setOpacity(opacity[version], { datasetId: DS.landCover(version), sublayerId: lcSublayerId(type) })
         })
       })
+      datasetsPlugin.setOpacity(opacity.previous, { datasetId: DS.outlinePrevious })
       setVersionVisibility('previous', t < 1)
       setVersionVisibility('current', t > 0)
       // No visible status line — the map is the feedback. Screen reader users get the
@@ -1596,7 +1672,7 @@
       })
       VERSIONS.forEach(v => order.push(LC_SELECTED(v)))
       CHANGE_KINDS.forEach(kind => order.push(CHANGE_LAYER(kind)))
-      order.push(DS.outline, DS.hedgerows)
+      order.push(DS.outlinePrevious, DS.outline, DS.hedgerows)
       order.forEach(id => { if (hedgeMap.getLayer(id)) hedgeMap.moveLayer(id) })
     }
 
@@ -1782,8 +1858,74 @@
         syncLandCoverKey(v, data[v].parcelCovers, { preserveSelection })
       })
       datasetsPlugin.setData({ type: 'FeatureCollection', features: [data.current.selectedFeature] }, { datasetId: DS.outline })
+      datasetsPlugin.setData({ type: 'FeatureCollection', features: previousOutlineFeatures() }, { datasetId: DS.outlinePrevious })
       datasetsPlugin.setData({ type: 'FeatureCollection', features: data.current.parcelHedges }, { datasetId: DS.hedgerows })
       datasetsPlugin.setDatasetVisibility(data.current.parcelHedges.length > 0, { datasetId: DS.hedgerows })
+    }
+
+    // Replace the previous version with another snapshot file (view-land-parcel-dates-list,
+    // where each listed date is its own file). Re-runs the load pipeline for the previous side
+    // only — fetch → buildParcelData → stampIds → diff → tables → stampDiffKind — then pushes
+    // the new features (and the current side's re-stamped diffKind) to the map, drops the
+    // land cover selection (its previous-side ids belong to the old snapshot) and re-asserts
+    // the Key and the radios' visibility. Resolves once the page reflects the snapshot; a
+    // failed fetch rejects and leaves the page on the snapshot it had.
+    // A snapshot file may carry the parcel boundary AS IT WAS in a top-level `parcel`
+    // Feature (same properties as a LandParcels WFS feature). Then the previous version uses
+    // that outline; otherwise it shares the live one.
+    function snapshotParcels (beforeCovers) {
+      const own = (x) => JSON.parse(JSON.stringify(x))
+      return beforeCovers.parcel ? { features: [own(beforeCovers.parcel)] } : own(rawParcels)
+    }
+
+    function loadPreviousSnapshot (file, dateLabel) {
+      if (!data || !rawParcels || !rawHedges) return Promise.reject(new Error('parcel not loaded'))
+      return cachedFetchJson(file).then(beforeCovers => {
+        const own = (x) => JSON.parse(JSON.stringify(x))
+        const dPrev = buildParcelData(selectedNgc, snapshotParcels(beforeCovers), own(beforeCovers), own(rawHedges))
+        if (!dPrev.selectedFeature) throw new Error('snapshot has no parcel feature')
+        const dCurr = data.current
+        stampIds(dPrev)
+        const marks = {
+          covers: diffCovers(dPrev.parcelCovers, dCurr.parcelCovers),
+          hedges: diffHedges(dPrev.parcelHedges, dCurr.parcelHedges)
+        }
+        data = { previous: dPrev, current: dCurr, marks }
+
+        if (dateLabel) {
+          const dateRange = document.getElementById('compare-date-range')
+          if (dateRange) dateRange.textContent = dateLabel
+          const previousTabDateText = document.getElementById('previous-tab-date-range-text')
+          if (previousTabDateText) previousTabDateText.textContent = dateLabel
+        }
+
+        selection = null
+        resetSummaryRows()
+        if (TABLE_LAYOUT === 'tabs') renderVersionTables(dPrev, dCurr, marks)
+        else renderMergedTables(dPrev, dCurr, marks)
+        stampDiffKind(dPrev, dCurr, marks)
+
+        // Before the map exists there is nothing to push: buildMap reads `data` when it runs.
+        if (!datasetsPlugin) return
+        selectLandCover(null, null)
+        // preserveSelection keeps the user's Layers-panel ticks for the cover types that are
+        // still present; applyVersionRadio then hides the previous side outright if the radios
+        // say only the current version is on show (a cover type new to this snapshot would
+        // otherwise appear even though "Previous details" is not selected).
+        swapParcelDatasets({ preserveSelection: true })
+        if (COMPARE_MODE === 'fade') applyFade(fadePosition)
+        applyVersionRadio()
+        syncOverlayLayers()
+        // A snapshot whose boundary reaches outside the current view: pan/zoom out to show
+        // both boundaries. Left alone otherwise, so switching dates does not jolt the map.
+        if (hedgeMap && previousOutlineFeatures().length) {
+          const b = bothVersionsBounds()
+          const view = hedgeMap.getBounds()
+          if (!view.contains([b[0], b[1]]) || !view.contains([b[2], b[3]])) {
+            hedgeMap.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 40, duration: 500 })
+          }
+        }
+      })
     }
 
     // ───────────────────────────────────────────────────────────────────────────
@@ -1813,13 +1955,15 @@
         })
       }
       datasets.push(
+        buildPreviousOutlineDataset(previousOutlineFeatures()),
         buildParcelOutlineDataset(data.current.selectedFeature),
         buildHedgerowDataset(data.current.parcelHedges)
       )
 
-      // Frame the map on the parcel at construction time (fits with duration:0 inside the
-      // library), so the map opens already framed with no visible pan/zoom.
-      const parcelBounds = computeBounds(data.current.selectedFeature)
+      // Frame the map on the parcel (both versions' boundaries) at construction time (fits
+      // with duration:0 inside the library), so the map opens already framed with no
+      // visible pan/zoom.
+      const parcelBounds = bothVersionsBounds()
 
       datasetsPlugin = defra.datasetsMaplibrePlugin({ datasets })
       interact = defra.interactPlugin({
@@ -2008,7 +2152,9 @@
         // (landCoverId, hedgeId, diffKind) and sorts in place, and the datasets adapter hands
         // the geojson straight to each source.
         const own = (x) => JSON.parse(JSON.stringify(x))
-        const dPrev = buildParcelData(selectedNgc, own(parcelsData), beforeCovers, own(hedgeData))
+        rawParcels = parcelsData
+        rawHedges = hedgeData
+        const dPrev = buildParcelData(selectedNgc, snapshotParcels(beforeCovers), beforeCovers, own(hedgeData))
         const dCurr = buildParcelData(selectedNgc, own(parcelsData), currentCovers, own(hedgeData))
 
         if (!dPrev.selectedFeature || !dCurr.selectedFeature) {
